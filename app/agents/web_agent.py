@@ -1,114 +1,20 @@
-import httpx
-from duckduckgo_search import DDGS
-import trafilatura
+"""
+Refactored WebAgent using pluggable retriever backends.
+"""
 import asyncio
 import logging
-import hashlib
-import os
-from typing import List, Dict, Optional
+from typing import List
 from app.models import ResearchTask, ResearchFinding
-from app.seeds import SEEDS_BY_CATEGORY, KEYWORDS
+from app.seeds import KEYWORDS
+from app.retrievers import get_retriever, Document
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = "cache"
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
-
 class WebAgent:
     def __init__(self):
-        # self.ddgs = DDGS() # Disabled for now to force Seed Mode as requested
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+        self.retriever = get_retriever()
+        self.trace_log = []  # For UI display
         
-    def _get_cache_path(self, url: str) -> str:
-        """Simple disk cache path based on URL hash."""
-        hash_digest = hashlib.md5(url.encode()).hexdigest()
-        return os.path.join(CACHE_DIR, f"{hash_digest}.txt")
-
-    def _get_seeds_for_task(self, task_description: str) -> List[str]:
-        """Selects the best seed URLs based on task keywords."""
-        desc_lower = task_description.lower()
-        if "player" in desc_lower or "competitor" in desc_lower or "company" in desc_lower:
-            return SEEDS_BY_CATEGORY["key_players"]
-        elif "trend" in desc_lower or "future" in desc_lower:
-            return SEEDS_BY_CATEGORY["trends"]
-        elif "need" in desc_lower or "challenge" in desc_lower or "limitation" in desc_lower or "gap" in desc_lower:
-            return SEEDS_BY_CATEGORY["unmet_needs"]
-        else:
-            return SEEDS_BY_CATEGORY["default"]
-
-    async def _search(self, query: str, max_results=5) -> List[str]:
-        """Disabled DDG for now to force robust seeded URLs."""
-        # For this iteration, we bypass DDG entirely to ensure we use our high-quality seeds.
-        # In production, we would uncomment the DDG logic here.
-        return []
-
-    async def _fetch_and_extract(self, url: str) -> Optional[ResearchFinding]:
-        """Step B & C: Robust Fetch with Caching & Simplified Extract."""
-        
-        # Check Cache First
-        cache_path = self._get_cache_path(url)
-        if os.path.exists(cache_path):
-            print(f"DEBUG: Cache hit for {url}")
-            with open(cache_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return ResearchFinding(
-                source_url=url,
-                content=content,
-                relevance_score=1.0,
-                extracted_data={"cached": True}
-            )
-
-        print(f"DEBUG: Fetching {url}")
-        html_content = ""
-        
-        # 1. Try httpx (Async)
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=True) as client: # Verify=True for security
-                resp = await client.get(url, headers=self.headers)
-                resp.raise_for_status()
-                html_content = resp.text
-        except Exception as e:
-            print(f"DEBUG: Httpx failed for {url}: {e}. Retrying with Requests...")
-            # 2. Key Fallback: Requests (Sync, but robust)
-            try:
-                import requests
-                resp = requests.get(url, headers=self.headers, timeout=15, verify=True) # Verify=True
-                resp.raise_for_status()
-                html_content = resp.text
-            except Exception as e2:
-                 print(f"DEBUG: Requests failed for {url}: {e2}")
-                 return None
-
-        # Step C: Extract
-        try:
-            extracted = trafilatura.extract(html_content, include_comments=False, include_tables=True)
-            
-            # Loosen Thin Content Rule
-            if extracted and len(extracted) > 200:
-                print(f"DEBUG: Extracted {len(extracted)} chars from {url}")
-                
-                # Write to Cache
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write(extracted)
-                    
-                return ResearchFinding(
-                    source_url=url,
-                    content=extracted,
-                    relevance_score=1.0, 
-                    extracted_data={"title": "Extracted Content"} 
-                )
-            else:
-                print(f"DEBUG: Page skipped (Too thin): {url} (len={len(extracted) if extracted else 0})")
-                return None
-        except Exception as e:
-             print(f"DEBUG: Extraction failed for {url}: {e}")
-             return None
-
     def _score_relevance(self, content: str) -> int:
         """Scores content based on keyword hits."""
         score = 0
@@ -116,54 +22,77 @@ class WebAgent:
         for kw in KEYWORDS:
             score += content_lower.count(kw)
         return score
-
+    
     async def execute_task(self, task: ResearchTask) -> ResearchFinding:
         """
-        Executes search, fetch, extract loop with retry logic.
+        Executes research task using configured retriever backend.
         """
         print(f"--- WEB AGENT: Processing '{task.description}' ---")
         
-        # 1. Search (or get seeds)
-        # Force SEEDS Mode for this task based on category logic
-        urls = self._get_seeds_for_task(task.description)
-        print(f"DEBUG: Selected {len(urls)} seeds for task: {task.description[:50]}...")
-            
-        # 3. Fetch & Extract (Parallel)
-        tasks = [self._fetch_and_extract(u) for u in urls]
-        results = await asyncio.gather(*tasks)
+        # 1. Search for URLs
+        url_candidates = await self.retriever.search(task.description, max_results=8)
+        urls = [candidate.url for candidate in url_candidates]
+        print(f"[WEB_AGENT] Found {len(urls)} URLs to fetch")
         
-        # Filter valid results
-        valid_findings = [r for r in results if r is not None]
+        # 2. Fetch documents in parallel
+        documents = await self.retriever.fetch_many(urls)
+        print(f"[WEB_AGENT] Successfully fetched {len(documents)} documents")
         
-        # 4. Relevance Scoring & Truncation
-        scored_findings = []
-        for f in valid_findings:
-            score = self._score_relevance(f.content)
-            f.relevance_score = float(score)
-            scored_findings.append(f)
-            
-        # Sort by score descending
-        scored_findings.sort(key=lambda x: x.relevance_score, reverse=True)
+        # Log retrieval methods for UI
+        for doc in documents:
+            self.trace_log.append({
+                "url": doc.url,
+                "method": doc.retrieval_method,
+                "text_length": doc.text_length,
+                "title": doc.title
+            })
         
-        # Top-K Selection (e.g. Top 3)
-        top_findings = scored_findings[:3]
+        # 3. Score and rank documents
+        scored_docs = []
+        for doc in documents:
+            score = self._score_relevance(doc.text)
+            scored_docs.append((doc, score))
         
-        if not top_findings:
-             return ResearchFinding(source_url="N/A", content="No relevant text extracted.", relevance_score=0.0)
-
+        # Sort by relevance score
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        
+        # 4. Select top K documents
+        top_k = 3
+        top_docs = scored_docs[:top_k]
+        
+        if not top_docs:
+            return ResearchFinding(
+                source_url="N/A",
+                content="No relevant content extracted.",
+                relevance_score=0.0
+            )
+        
+        # 5. Combine top documents
         combined_text = ""
         urls_list = []
-        for f in top_findings:
-            # Truncate long pages
-            truncated_content = f.content[:3000] 
-            combined_text += f"\n\n=== SOURCE: {f.source_url} (Score: {int(f.relevance_score)}) ===\n{truncated_content}" 
-            urls_list.append(f.source_url)
-            
-        print(f"DEBUG: Final selection: {len(top_findings)} sources.")
+        for doc, score in top_docs:
+            # Truncate to 3000 chars per document
+            truncated = doc.text[:3000]
+            combined_text += f"\n\n=== SOURCE: {doc.url} (Score: {int(score)}, Method: {doc.retrieval_method}) ===\n{truncated}"
+            urls_list.append(doc.url)
+        
+        print(f"[WEB_AGENT] Final selection: {len(top_docs)} sources")
         
         return ResearchFinding(
             source_url="Multiple Sources",
-            content=combined_text, 
+            content=combined_text,
             relevance_score=1.0,
-            extracted_data={"source_count": len(top_findings), "urls": urls_list}
+            extracted_data={
+                "source_count": len(top_docs),
+                "urls": urls_list,
+                "retrieval_methods": [doc.retrieval_method for doc, _ in top_docs]
+            }
         )
+    
+    def get_trace_log(self) -> List[dict]:
+        """Get browsing trace for UI."""
+        return self.trace_log
+    
+    def clear_trace_log(self):
+        """Clear trace log."""
+        self.trace_log = []
